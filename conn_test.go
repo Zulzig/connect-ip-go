@@ -51,7 +51,7 @@ type mockStream struct {
 	qlogTrace       qlogwriter.Trace
 }
 
-var _ http3Stream = &mockStream{}
+var _ Stream = &mockStream{}
 
 func (m *mockStream) StreamID() quic.StreamID     { return 0 }
 func (m *mockStream) QlogTrace() qlogwriter.Trace { return m.qlogTrace }

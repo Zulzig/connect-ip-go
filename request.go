@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -56,10 +55,8 @@ func (r *Request) Header() http.Header { return r.req.Header }
 func (r *Request) httpRequest() *http.Request { return r.req }
 
 // ProxyRequest is the parsed CONNECT-IP request returned from ParseProxyRequest.
-// It currently doesn't have any exported fields, since connect-ip-go doesn't support IP flow forwarding.
-type ProxyRequest struct {
-	body io.ReadCloser // the capsules of the client, on HTTP/2
-}
+// It currently doesn't have any fields, since connect-ip-go doesn't support IP flow forwarding.
+type ProxyRequest struct{}
 
 // ProxyRequestParseError is returned from ParseProxyRequest if parsing the CONNECT-IP request fails.
 // It is recommended that the request is rejected with the corresponding HTTP status code.
@@ -91,16 +88,10 @@ func ParseProxyRequest(r *http.Request, template *uritemplate.Template) (*ProxyR
 			Err:        fmt.Errorf("expected CONNECT request, got %s", r.Method),
 		}
 	}
-	// On HTTP/3, the http3 package puts the :protocol pseudo-header in r.Proto.
-	// On HTTP/2, net/http leaves it in the header map.
-	protocol := r.Proto
-	if r.ProtoMajor == 2 {
-		protocol = r.Header.Get(":protocol")
-	}
-	if protocol != requestProtocol {
+	if r.Proto != requestProtocol {
 		return nil, &ProxyRequestParseError{
 			HTTPStatus: http.StatusNotImplemented,
-			Err:        fmt.Errorf("unexpected protocol: %s", protocol),
+			Err:        fmt.Errorf("unexpected protocol: %s", r.Proto),
 		}
 	}
 	if r.Host != u.Host {
@@ -135,8 +126,5 @@ func ParseProxyRequest(r *http.Request, template *uritemplate.Template) (*ProxyR
 		}
 	}
 
-	if r.ProtoMajor == 2 {
-		return &ProxyRequest{body: r.Body}, nil
-	}
 	return &ProxyRequest{}, nil
 }

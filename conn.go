@@ -27,7 +27,13 @@ type CloseError struct {
 func (e *CloseError) Error() string        { return net.ErrClosed.Error() }
 func (e *CloseError) Is(target error) bool { return target == net.ErrClosed }
 
-type http3Stream interface {
+// Stream is the request stream that carries a proxied connection: its capsules, and its datagrams.
+// The request streams of the http3 package implement it. Another transport can implement it
+// to carry a proxied connection over something else than HTTP/3, and get the Conn from [NewConn].
+//
+// Conn writes one complete capsule per call to Write, and only calls SetWriteDeadline
+// to interrupt a blocked Write when it shuts down.
+type Stream interface {
 	io.ReadWriteCloser
 	ReceiveDatagram(context.Context) ([]byte, error)
 	SendDatagram([]byte) error
@@ -39,8 +45,8 @@ type http3Stream interface {
 }
 
 var (
-	_ http3Stream = &http3.Stream{}
-	_ http3Stream = &http3.RequestStream{}
+	_ Stream = &http3.Stream{}
+	_ Stream = &http3.RequestStream{}
 )
 
 // If a packet is too large to fit into a QUIC datagram,
@@ -57,9 +63,9 @@ type streamWrite struct {
 	Fin  bool
 }
 
-// Conn is a connection that proxies IP packets over HTTP/3 or HTTP/2.
+// Conn is a connection that proxies IP packets over HTTP/3.
 type Conn struct {
-	str         http3Stream
+	str         Stream
 	closeConn   func() error
 	writeNotify chan struct{}
 	writeDone   chan error
@@ -86,7 +92,13 @@ type Conn struct {
 	qloggerProducers int // the open connection, and calls that may produce qlog events
 }
 
-func newProxiedConn(str http3Stream, closeConn func() error) *Conn {
+// NewConn returns the proxied connection that str carries, once the peer accepted the request.
+// It is for transports that connect-ip-go doesn't implement: over HTTP/3,
+// [ClientConn.Dial] and [Proxy.Proxy] return the Conn.
+// Closing the Conn closes str, but not the connection that carries it.
+func NewConn(str Stream) *Conn { return newProxiedConn(str, nil) }
+
+func newProxiedConn(str Stream, closeConn func() error) *Conn {
 	var qlogger qlogwriter.Recorder
 	if qlogTrace := str.QlogTrace(); qlogTrace != nil {
 		qlogger = qlogTrace.AddProducer()

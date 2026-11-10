@@ -75,6 +75,7 @@ type http2Stream struct {
 
 var _ http3Stream = &http2Stream{}
 
+// newHTTP2Stream wraps body, and starts sending the capsules that Write queues.
 func newHTTP2Stream(body http2Body) *http2Stream {
 	s := &http2Stream{
 		body:      body,
@@ -107,6 +108,8 @@ func (s *http2Stream) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// nextCapsule reads the header of the next capsule. A DATAGRAM capsule is read whole and queued
+// for ReceiveDatagram, or dropped when too large or the queue is full; another one is left for Read.
 func (s *http2Stream) nextCapsule() error {
 	typ, err := quicvarint.Read(s.r)
 	if err != nil {
@@ -136,6 +139,7 @@ func (s *http2Stream) nextCapsule() error {
 	return nil
 }
 
+// truncatedCapsule reports the end of the stream in the middle of a capsule as an error.
 func truncatedCapsule(err error) error {
 	if err == io.EOF {
 		return io.ErrUnexpectedEOF
@@ -203,6 +207,7 @@ func (s *http2Stream) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// writeErr returns why the stream can't take more capsules, or nil if it can.
 func (s *http2Stream) writeErr() error {
 	if s.err != nil {
 		return s.err
@@ -213,6 +218,7 @@ func (s *http2Stream) writeErr() error {
 	return nil
 }
 
+// flush sends the queued capsules until the stream is closed and the queue empty, or a write fails.
 func (s *http2Stream) flush() {
 	defer close(s.flushed)
 
@@ -279,8 +285,10 @@ func (s *http2Stream) Close() error {
 	}
 }
 
+// CancelRead stops reading the stream. HTTP/2 has no STOP_SENDING to tell the peer, so the code goes unused.
 func (s *http2Stream) CancelRead(quic.StreamErrorCode) { s.body.CloseRead() }
 
+// CancelWrite drops the queued capsules and resets the stream.
 func (s *http2Stream) CancelWrite(code quic.StreamErrorCode) {
 	s.mu.Lock()
 	s.closed = true
@@ -290,6 +298,7 @@ func (s *http2Stream) CancelWrite(code quic.StreamErrorCode) {
 	s.body.Reset(http2ErrCode(code))
 }
 
+// http2ErrCode translates the HTTP/3 error code of a stream into its HTTP/2 counterpart.
 func http2ErrCode(code quic.StreamErrorCode) http2.ErrCode {
 	switch http3.ErrCode(code) {
 	case http3.ErrCodeNoError:
@@ -337,8 +346,10 @@ type proxyBody struct {
 	closed atomic.Bool
 }
 
+// Read reads the request body, which carries the capsules of the client.
 func (b *proxyBody) Read(p []byte) (int, error) { return b.body.Read(p) }
 
+// Write sends p on the response, and flushes it.
 func (b *proxyBody) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -358,6 +369,7 @@ func (b *proxyBody) CloseWrite() error {
 	return nil
 }
 
+// CloseRead closes the request body.
 func (b *proxyBody) CloseRead() { b.body.Close() }
 
 // Reset relies on net/http resetting the stream, with INTERNAL_ERROR,

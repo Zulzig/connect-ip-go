@@ -161,6 +161,7 @@ func http2TestPacket(t *testing.T, src, dst netip.Addr, payload []byte) []byte {
 	return append(hdr, payload...)
 }
 
+// requireClosed fails the test unless conn shuts down, with net.ErrClosed, within 5 seconds.
 func requireClosed(t *testing.T, conn *Conn) {
 	t.Helper()
 	errChan := make(chan error, 1)
@@ -232,6 +233,7 @@ func TestHTTP2ClientConnClose(t *testing.T) {
 	requireClosed(t, proxy)
 }
 
+// TestHTTP2Refused checks that Dial returns the response that refuses the request, with its status.
 func TestHTTP2Refused(t *testing.T) {
 	for _, status := range []int{http.StatusForbidden, http.StatusConflict} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
@@ -261,6 +263,8 @@ func TestHTTP2Ping(t *testing.T) {
 	require.ErrorIs(t, clientConn.Ping(ctx), net.ErrClosed)
 }
 
+// TestHTTP2OutlivesServerTimeouts checks that the read and write deadlines that a server set
+// before calling the handler don't end the proxied connection.
 func TestHTTP2OutlivesServerTimeouts(t *testing.T) {
 	// These are the deadlines of http.Server.ReadTimeout and WriteTimeout, without
 	// their effect on the TLS handshake, which would make this test depend on the machine.

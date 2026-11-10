@@ -89,6 +89,7 @@ func (p *fakeHTTP2Proxy) writeResponse(status string, endStream bool) {
 	p.writeHeaders(endStream, hpack.HeaderField{Name: ":status", Value: status})
 }
 
+// writeHeaders sends a HEADERS frame with fields on the stream of the client.
 func (p *fakeHTTP2Proxy) writeHeaders(endStream bool, fields ...hpack.HeaderField) {
 	p.t.Helper()
 	var block bytes.Buffer
@@ -109,6 +110,7 @@ func (p *fakeHTTP2Proxy) drain() {
 	go func() { io.Copy(io.Discard, p.conn) }()
 }
 
+// waitForFailure waits for c to fail, and returns why.
 func (c *HTTP2ClientConn) waitForFailure(t *testing.T) error {
 	t.Helper()
 	select {
@@ -173,8 +175,10 @@ func TestHTTP2ClientRequest(t *testing.T) {
 	req := newHTTP2TestRequest(t, t.Context())
 	req.Header().Set("Authorization", "Bearer token")
 	// Connection-specific header fields don't exist in HTTP/2: RFC 9113, section 8.2.2.
-	req.Header().Set("Connection", "keep-alive")
+	// They include those that Connection names, RFC 9110, section 7.6.1.
+	req.Header().Set("Connection", "keep-alive, X-Hop , TE")
 	req.Header().Set("Keep-Alive", "timeout=5")
+	req.Header().Set("X-Hop", "1")
 	// Except TE, which can only say "trailers".
 	req.Header().Set("Te", "gzip, trailers")
 	go c.Dial(req)
@@ -197,6 +201,7 @@ func TestHTTP2ClientRequest(t *testing.T) {
 	}, headers.RegularFields())
 }
 
+// TestHTTP2ClientDropsTEWithoutTrailers checks that a TE header field without "trailers" isn't sent.
 func TestHTTP2ClientDropsTEWithoutTrailers(t *testing.T) {
 	req := newHTTP2TestRequest(t, t.Context())
 	req.Header().Set("Te", "gzip")
@@ -224,6 +229,7 @@ func TestHTTP2ClientSettings(t *testing.T) {
 	require.EqualValues(t, 1<<20-http2InitialWindow, update.Increment)
 }
 
+// TestHTTP2ClientReceiveWindowLimits checks the receive window that HTTP2Config.ReceiveWindow gives.
 func TestHTTP2ClientReceiveWindowLimits(t *testing.T) {
 	for name, tc := range map[string]struct {
 		conf *HTTP2Config
@@ -289,6 +295,7 @@ func TestHTTP2ClientDialOnce(t *testing.T) {
 	})
 }
 
+// TestHTTP2ClientInvalidHeader checks that Dial refuses a header field that HTTP/2 can't carry.
 func TestHTTP2ClientInvalidHeader(t *testing.T) {
 	for name, header := range map[string][2]string{
 		"name":  {"Bad Name", "value"},
@@ -330,6 +337,7 @@ func TestHTTP2ClientRefused(t *testing.T) {
 	require.Equal(t, http2.ErrCodeCancel, rst.ErrCode)
 }
 
+// TestHTTP2ClientStatusWithoutCapsules checks that Dial rejects the statuses that can't carry capsules.
 func TestHTTP2ClientStatusWithoutCapsules(t *testing.T) {
 	// RFC 9297, section 3.2: a response that uses the Capsule Protocol can't have these statuses.
 	for _, status := range []string{"204", "205", "206"} {
@@ -350,6 +358,8 @@ func TestHTTP2ClientStatusWithoutCapsules(t *testing.T) {
 	}
 }
 
+// TestHTTP2ClientRefusedThenClosed checks that a refusal followed by the end of the connection
+// still reaches Dial.
 func TestHTTP2ClientRefusedThenClosed(t *testing.T) {
 	// The refusal must not get lost in the failure of the connection that follows it.
 	for range 20 {
@@ -369,18 +379,53 @@ func TestHTTP2ClientRefusedThenClosed(t *testing.T) {
 	}
 }
 
-func TestHTTP2ClientNoStreamsAllowed(t *testing.T) {
+// TestHTTP2ClientWaitsForStreams checks that Dial waits while the proxy allows no streams.
+func TestHTTP2ClientWaitsForStreams(t *testing.T) {
 	p, c := newFakeHTTP2Proxy(t, nil)
 	result := dialAsync(t, t.Context(), c)
 	p.handshake(extendedConnectSetting, http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 0})
 	nextFrame[*http2.SettingsFrame](p) // the ACK
+	c.waitForStreams(t)
+	require.NoError(t, p.fr.WriteSettings(http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1}))
+
+	// The request only follows the ACK of the setting that allows it.
+	f, err := p.fr.ReadFrame()
+	require.NoError(t, err)
+	require.IsType(t, &http2.SettingsFrame{}, f)
+	require.True(t, f.(*http2.SettingsFrame).IsAck())
+	nextFrame[*http2.MetaHeadersFrame](p)
+	p.writeResponse("200", false)
 	r := <-result
-	require.ErrorContains(t, r.err, "server accepts no streams")
+	require.NoError(t, r.err)
+	require.NotNil(t, r.conn)
+}
+
+// TestHTTP2ClientStopsWaitingForStreams checks that the context of the request ends the wait for a stream.
+func TestHTTP2ClientStopsWaitingForStreams(t *testing.T) {
+	p, c := newFakeHTTP2Proxy(t, nil)
+	ctx, cancel := context.WithCancelCause(t.Context())
+	result := dialAsync(t, ctx, c)
+	p.handshake(extendedConnectSetting, http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 0})
+	nextFrame[*http2.SettingsFrame](p) // the ACK
+	c.waitForStreams(t)
+	cancel(errors.New("gave up"))
+	require.ErrorContains(t, (<-result).err, "gave up")
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	require.False(t, c.dialed, "the request wasn't sent")
 }
 
+// waitForStreams waits for Dial to wait until the proxy allows streams.
+func (c *HTTP2ClientConn) waitForStreams(t *testing.T) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.streamsAllowed != nil
+	}, fakeHTTP2Timeout, time.Millisecond)
+}
+
+// TestHTTP2ClientInterimResponseEndingStream checks that an interim response can't end the stream.
 func TestHTTP2ClientInterimResponseEndingStream(t *testing.T) {
 	p, c := newFakeHTTP2Proxy(t, nil)
 	result := dialAsync(t, t.Context(), c)
@@ -409,6 +454,7 @@ func TestHTTP2ClientIgnoresInterimResponses(t *testing.T) {
 	require.NoError(t, r.conn.Close())
 }
 
+// TestHTTP2ClientMalformed checks that the frames that break HTTP/2 end the connection.
 func TestHTTP2ClientMalformed(t *testing.T) {
 	for name, tc := range map[string]struct {
 		send func(*fakeHTTP2Proxy)
@@ -476,6 +522,7 @@ func TestHTTP2ClientMalformed(t *testing.T) {
 	}
 }
 
+// TestHTTP2ClientInvalidStatus checks that Dial rejects a :status that isn't 3 digits.
 func TestHTTP2ClientInvalidStatus(t *testing.T) {
 	// RFC 9113, section 8.3.2: a 3-digit code, which strconv alone would read more liberally.
 	for _, status := range []string{"+20", "0200", "20", "2O0"} {
@@ -490,6 +537,7 @@ func TestHTTP2ClientInvalidStatus(t *testing.T) {
 	}
 }
 
+// TestHTTP2ClientWindowOverflow checks that a send window beyond 2^31-1 ends the connection.
 func TestHTTP2ClientWindowOverflow(t *testing.T) {
 	flowControlError := http2.ConnectionError(http2.ErrCodeFlowControl)
 	for name, send := range map[string]func(*fakeHTTP2Proxy){
@@ -567,6 +615,8 @@ func TestHTTP2ClientStreamReset(t *testing.T) {
 	})
 }
 
+// TestHTTP2ClientRespectsFlowControl checks that the client doesn't send more than the stream window,
+// and resumes when the proxy widens it.
 func TestHTTP2ClientRespectsFlowControl(t *testing.T) {
 	const window = 100
 	p, c := newFakeHTTP2Proxy(t, nil)
@@ -611,6 +661,8 @@ func TestHTTP2ClientRespectsFlowControl(t *testing.T) {
 	require.EqualValues(t, len(data), sent)
 }
 
+// TestHTTP2ClientRespectsConnectionWindow checks that the connection window limits the client
+// as well as the stream window.
 func TestHTTP2ClientRespectsConnectionWindow(t *testing.T) {
 	p, c := newFakeHTTP2Proxy(t, nil)
 	conn := p.establish(c, http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 24})
@@ -646,6 +698,8 @@ func TestHTTP2ClientRespectsMaxFrameSize(t *testing.T) {
 	require.Len(t, nextFrame[*http2.DataFrame](p).Data(), maxFrame)
 }
 
+// TestHTTP2ClientRespectsLoweredMaxFrameSize checks that DATA frames follow a SETTINGS_MAX_FRAME_SIZE
+// that the proxy lowered after the reservation.
 func TestHTTP2ClientRespectsLoweredMaxFrameSize(t *testing.T) {
 	const maxFrame = 2 * http2InitialMaxFrameSize
 	p, c := newFakeHTTP2Proxy(t, nil)
@@ -718,6 +772,8 @@ func TestHTTP2ClientNoDataAfterReset(t *testing.T) {
 	require.NoError(t, c.failure())
 }
 
+// TestHTTP2ClientResetInterruptsBlockedWrite checks that a reset doesn't wait for a DATA write
+// that the network blocks.
 func TestHTTP2ClientResetInterruptsBlockedWrite(t *testing.T) {
 	p, c := newFakeHTTP2Proxy(t, nil)
 	conn := p.establish(c)
@@ -753,6 +809,7 @@ func (p *fakeHTTP2Proxy) nextCredit() uint32 {
 	return stream.Increment
 }
 
+// TestHTTP2ClientCreditsWhatItReads checks that the client credits what it reads, in batches.
 func TestHTTP2ClientCreditsWhatItReads(t *testing.T) {
 	p, c := newFakeHTTP2Proxy(t, &HTTP2Config{ReceiveWindow: http2InitialWindow})
 	p.establish(c)
@@ -773,6 +830,7 @@ func TestHTTP2ClientCreditsWhatItReads(t *testing.T) {
 	require.LessOrEqual(t, credit, uint32(frames*frameLen))
 }
 
+// TestHTTP2ClientCreditsPadding checks that the client credits padding without waiting for a reader.
 func TestHTTP2ClientCreditsPadding(t *testing.T) {
 	// Flow control covers padding, which no reader is ever going to consume.
 	const frameLen = 256 // with the Pad Length field
@@ -785,6 +843,7 @@ func TestHTTP2ClientCreditsPadding(t *testing.T) {
 	require.Equal(t, uint32(frames*frameLen), p.nextCredit())
 }
 
+// TestHTTP2ClientFlowControlViolation checks that data beyond the receive window ends the connection.
 func TestHTTP2ClientFlowControlViolation(t *testing.T) {
 	p, c := newFakeHTTP2Proxy(t, &HTTP2Config{ReceiveWindow: http2InitialWindow})
 	p.drain()
@@ -799,6 +858,8 @@ func TestHTTP2ClientFlowControlViolation(t *testing.T) {
 	require.ErrorIs(t, c.waitForFailure(t), http2.ConnectionError(http2.ErrCodeFlowControl))
 }
 
+// TestHTTP2ClientDropsDataAfterCloseRead checks that after CloseRead, the client drops what the proxy
+// sends, and credits it.
 func TestHTTP2ClientDropsDataAfterCloseRead(t *testing.T) {
 	p, c := newFakeHTTP2Proxy(t, &HTTP2Config{ReceiveWindow: http2InitialWindow})
 	require.NoError(t, p.fr.WriteSettings())
@@ -823,6 +884,8 @@ func TestHTTP2ClientDropsDataAfterCloseRead(t *testing.T) {
 	require.NoError(t, c.failure())
 }
 
+// TestHTTP2ClientWindowOnlyWidensWithTransmittedCredit checks that credit the writer couldn't take
+// doesn't widen the receive window, nor make the control queue grow.
 func TestHTTP2ClientWindowOnlyWidensWithTransmittedCredit(t *testing.T) {
 	// The proxy never reads: the first WINDOW_UPDATE blocks the writer. The credit for
 	// the padding that follows can't reach it, so the padding counts against the window.
@@ -867,6 +930,8 @@ func TestHTTP2ClientTrailers(t *testing.T) {
 	require.NoError(t, c.failure(), "the trailers were valid")
 }
 
+// TestHTTP2ClientStreamViolations checks that the frames that break the state of the stream
+// end the connection, with the matching error code.
 func TestHTTP2ClientStreamViolations(t *testing.T) {
 	endStream := func(p *fakeHTTP2Proxy) { require.NoError(p.t, p.fr.WriteData(http2StreamID, true, nil)) }
 	for name, tc := range map[string]struct {
@@ -913,6 +978,7 @@ func TestHTTP2ClientStreamViolations(t *testing.T) {
 	}
 }
 
+// TestHTTP2ClientCloseSendsEndStream checks that closing the Conn ends the stream.
 func TestHTTP2ClientCloseSendsEndStream(t *testing.T) {
 	p, c := newFakeHTTP2Proxy(t, nil)
 	conn := p.establish(c)
@@ -936,6 +1002,8 @@ func TestHTTP2ClientAnswersProxy(t *testing.T) {
 	require.Equal(t, data, ping.Data)
 }
 
+// TestHTTP2ClientControlFramesDoNotWaitForData checks that the read loop answers the proxy while a DATA write
+// blocks, and that a proxy that never reads its answers ends the connection.
 func TestHTTP2ClientControlFramesDoNotWaitForData(t *testing.T) {
 	p, c := newFakeHTTP2Proxy(t, nil)
 	conn := p.establish(c)
@@ -962,6 +1030,7 @@ func TestHTTP2ClientControlFramesDoNotWaitForData(t *testing.T) {
 	require.ErrorContains(t, c.waitForFailure(t), "doesn't read its control frames")
 }
 
+// TestHTTP2ClientPing checks that Ping returns once the proxy acknowledges its PING frame.
 func TestHTTP2ClientPing(t *testing.T) {
 	p, c := newFakeHTTP2Proxy(t, nil)
 	p.handshake()
@@ -989,6 +1058,8 @@ func TestHTTP2ClientPing(t *testing.T) {
 	require.Empty(t, c.pings)
 }
 
+// TestHTTP2ClientPingQueueIsBounded checks that Ping fails once the control queue is full,
+// without ending the connection.
 func TestHTTP2ClientPingQueueIsBounded(t *testing.T) {
 	p, c := newFakeHTTP2Proxy(t, nil)
 	p.handshake()
@@ -1005,6 +1076,28 @@ func TestHTTP2ClientPingQueueIsBounded(t *testing.T) {
 	require.NoError(t, c.failure(), "whether to give up on the connection is the caller's call")
 }
 
+// TestHTTP2ClientControlQueueBoundsEveryFrame checks that the frames the client owes the proxy
+// respect the limit too, and end the connection when they can't be sent.
+func TestHTTP2ClientControlQueueBoundsEveryFrame(t *testing.T) {
+	p, c := newFakeHTTP2Proxy(t, nil)
+	p.handshake()
+	// The proxy reads nothing else: the SETTINGS ACK blocks the writer, and the PING frames fill the queue.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	var err error
+	for range maxQueuedHTTP2ControlFrames + 2 {
+		if err = c.Ping(ctx); !errors.Is(err, context.Canceled) {
+			break
+		}
+	}
+	require.ErrorContains(t, err, "doesn't read its control frames")
+	c.reset(http2.ErrCodeCancel)
+	require.ErrorContains(t, c.waitForFailure(t), "doesn't read its control frames")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	require.Len(t, c.control, maxQueuedHTTP2ControlFrames)
+}
+
 func TestHTTP2ClientPingOnFailedConnection(t *testing.T) {
 	p, c := newFakeHTTP2Proxy(t, nil)
 	p.drain()
@@ -1015,6 +1108,7 @@ func TestHTTP2ClientPingOnFailedConnection(t *testing.T) {
 	require.Error(t, c.Ping(t.Context()))
 }
 
+// TestHTTP2ClientWriteFailure checks that a failed write ends the connection and the Conn.
 func TestHTTP2ClientWriteFailure(t *testing.T) {
 	p, c := newFakeHTTP2Proxy(t, nil)
 	conn := p.establish(c)
@@ -1055,6 +1149,8 @@ func (c *brokenWritesConn) Write([]byte) (int, error) { return 0, errors.New("wr
 
 func (c *brokenWritesConn) Close() error { return nil }
 
+// TestHTTP2ClientReportsWhyWritesBroke checks that a failed write reports what the proxy sent
+// before closing, rather than the broken pipe.
 func TestHTTP2ClientReportsWhyWritesBroke(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		conn := &brokenWritesConn{read: make(chan struct{})}

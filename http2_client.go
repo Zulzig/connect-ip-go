@@ -73,9 +73,10 @@ type HTTP2ClientConn struct {
 	control         []func(*http2.Framer) error // frames owed to the proxy, written ahead of DATA frames
 	sawSettings     bool
 	extendedConnect bool
-	noStreams       bool // the proxy's SETTINGS_MAX_CONCURRENT_STREAMS is 0
-	dialing         bool // Dial was called
-	dialed          bool // the request was sent
+	noStreams       bool          // the proxy's SETTINGS_MAX_CONCURRENT_STREAMS is 0
+	streamsAllowed  chan struct{} // closed when the proxy allows streams again, if Dial waits for it
+	dialing         bool          // Dial was called
+	dialed          bool          // the request was sent
 	responded       bool
 	writing         bool // a DATA frame is being written, and may be blocked in the network
 	pingID          uint64
@@ -125,6 +126,8 @@ func NewHTTP2ClientConn(conn net.Conn, conf *HTTP2Config) *HTTP2ClientConn {
 	return c
 }
 
+// writePreface opens the connection: the client preface, the settings of the client, and the
+// connection-level window beyond the initial 65535 bytes, which no setting can change.
 func (c *HTTP2ClientConn) writePreface(fr *http2.Framer) error {
 	if _, err := io.WriteString(c.nc, http2.ClientPreface); err != nil {
 		return err
@@ -143,6 +146,8 @@ func (c *HTTP2ClientConn) writePreface(fr *http2.Framer) error {
 
 // Dial sends the request and waits for the response. The response comes back
 // whenever the proxy answered, for the caller to read the status of a refusal.
+// While the proxy allows no streams (SETTINGS_MAX_CONCURRENT_STREAMS of 0),
+// Dial waits for it to allow one, or for the context of the request to end.
 // An HTTP2ClientConn can only be used for one call to Dial, even if it fails.
 // Closing the returned Conn doesn't close the HTTP2ClientConn.
 func (c *HTTP2ClientConn) Dial(req *Request) (*Conn, *http.Response, error) {
@@ -175,28 +180,45 @@ func (c *HTTP2ClientConn) Dial(req *Request) (*Conn, *http.Response, error) {
 	}
 
 	c.mu.Lock()
-	if err := c.err; err != nil {
+	for {
+		if err := c.err; err != nil {
+			c.mu.Unlock()
+			return nil, nil, err
+		}
+		if !c.extendedConnect {
+			c.mu.Unlock()
+			return nil, nil, errors.New("connect-ip: server didn't enable Extended CONNECT")
+		}
+		if !c.noStreams {
+			break
+		}
+		// RFC 9113, section 5.1.2: a proxy should only refuse new streams for a short while.
+		if c.streamsAllowed == nil {
+			c.streamsAllowed = make(chan struct{})
+		}
+		allowed := c.streamsAllowed
 		c.mu.Unlock()
-		return nil, nil, err
+		select {
+		case <-ctx.Done():
+			return nil, nil, context.Cause(ctx)
+		case <-c.done:
+			return nil, nil, c.failure()
+		case <-allowed:
+		}
+		c.mu.Lock()
 	}
-	if !c.extendedConnect {
-		c.mu.Unlock()
-		return nil, nil, errors.New("connect-ip: server didn't enable Extended CONNECT")
-	}
-	if c.noStreams {
-		// Opening the stream would break the limit. The proxy may raise it later, but this
-		// connection only carries one stream: better to dial another one than to wait.
-		c.mu.Unlock()
-		return nil, nil, errors.New("connect-ip: server accepts no streams (SETTINGS_MAX_CONCURRENT_STREAMS is 0)")
-	}
-	c.dialed = true
-	c.queueControlFrame(func(fr *http2.Framer) error {
+	err = c.queueControlFrame(func(fr *http2.Framer) error {
 		return fr.WriteHeaders(http2.HeadersFrameParam{
 			StreamID:      http2StreamID,
 			BlockFragment: headers,
 			EndHeaders:    true,
 		})
 	})
+	if err != nil {
+		c.mu.Unlock()
+		return nil, nil, err
+	}
+	c.dialed = true
 	c.mu.Unlock()
 
 	rsp, err := c.waitForResponse(ctx)
@@ -217,6 +239,8 @@ func (c *HTTP2ClientConn) Dial(req *Request) (*Conn, *http.Response, error) {
 	return newProxiedConn(newHTTP2Stream(&clientBody{c: c}), nil), rsp, nil
 }
 
+// encodeHTTP2Request encodes the HEADERS of an Extended CONNECT request, with its own pseudo-header
+// fields and without the connection-specific ones, and checks that they fit in a single frame.
 func encodeHTTP2Request(req *http.Request) ([]byte, error) {
 	host := req.Host
 	if host == "" {
@@ -233,6 +257,18 @@ func encodeHTTP2Request(req *http.Request) ([]byte, error) {
 	write(":scheme", req.URL.Scheme)
 	write(":authority", host)
 	write(":path", req.URL.RequestURI())
+	// RFC 9110, section 7.6.1: Connection also names the fields that only concern this connection.
+	nominated := make(map[string]bool)
+	for name, values := range req.Header {
+		if !strings.EqualFold(name, "connection") {
+			continue
+		}
+		for _, value := range values {
+			for token := range strings.SplitSeq(value, ",") {
+				nominated[strings.ToLower(strings.TrimSpace(token))] = true
+			}
+		}
+	}
 	for name, values := range req.Header {
 		if !httpguts.ValidHeaderFieldName(name) {
 			return nil, fmt.Errorf("connect-ip: invalid header field name %q", name)
@@ -244,10 +280,13 @@ func encodeHTTP2Request(req *http.Request) ([]byte, error) {
 		case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
 			continue
 		case "te":
-			// The exception, which can only say "trailers".
+			// The exception, which can only say "trailers". HTTP/1.1 nominates it, which doesn't apply here.
 			if httpguts.HeaderValuesContainsToken(values, "trailers") {
 				write(name, "trailers")
 			}
+			continue
+		}
+		if nominated[name] {
 			continue
 		}
 		for _, value := range values {
@@ -263,6 +302,7 @@ func encodeHTTP2Request(req *http.Request) ([]byte, error) {
 	return block.Bytes(), nil
 }
 
+// waitForResponse waits for the response to the request, and resets the stream if ctx ends first.
 func (c *HTTP2ClientConn) waitForResponse(ctx context.Context) (*http.Response, error) {
 	select {
 	case rsp := <-c.response:
@@ -292,15 +332,15 @@ func (c *HTTP2ClientConn) Ping(ctx context.Context) error {
 		c.mu.Unlock()
 		return err
 	}
-	// A Ping that times out leaves its frame behind: don't let them pile up on a writer that stalled.
-	if err := c.checkControlQueue(); err != nil {
+	c.pingID++
+	binary.BigEndian.PutUint64(id[:], c.pingID)
+	// A Ping that times out leaves its frame behind: the limit of the queue keeps them from piling up
+	// on a writer that stalled. Whether to give up on the connection then is the caller's call.
+	if err := c.queueControlFrame(func(fr *http2.Framer) error { return fr.WritePing(false, id) }); err != nil {
 		c.mu.Unlock()
 		return err
 	}
-	c.pingID++
-	binary.BigEndian.PutUint64(id[:], c.pingID)
 	c.pings[id] = ack
-	c.queueControlFrame(func(fr *http2.Framer) error { return fr.WritePing(false, id) })
 	c.mu.Unlock()
 
 	defer func() {
@@ -324,12 +364,14 @@ func (c *HTTP2ClientConn) Close() error {
 	return nil
 }
 
+// failure returns why the connection failed, or nil if it didn't.
 func (c *HTTP2ClientConn) failure() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.err
 }
 
+// fail records err as the reason the connection failed, unless it already failed, and closes it.
 func (c *HTTP2ClientConn) fail(err error) {
 	c.mu.Lock()
 	if c.err == nil {
@@ -339,6 +381,18 @@ func (c *HTTP2ClientConn) fail(err error) {
 	}
 	c.mu.Unlock()
 	c.nc.Close()
+}
+
+// failLocked is fail for a caller that holds mu. Closing a TLS connection writes,
+// which a proxy that doesn't read would block: it happens on another goroutine.
+func (c *HTTP2ClientConn) failLocked(err error) {
+	if c.err != nil {
+		return
+	}
+	c.err = err
+	close(c.done)
+	c.cond.Broadcast()
+	go c.nc.Close()
 }
 
 // failWrite ends the connection after a failed write, and returns its error.
@@ -356,17 +410,26 @@ func (c *HTTP2ClientConn) failWrite(err error) error {
 	return c.failure()
 }
 
-func (c *HTTP2ClientConn) queueControlFrame(write func(*http2.Framer) error) {
+// queueControlFrame queues a frame owed to the proxy, which goes out ahead of DATA frames.
+// It refuses the frame once maxQueuedHTTP2ControlFrames wait: a proxy that doesn't read
+// must not make them pile up, whether it asks for them or Ping does.
+func (c *HTTP2ClientConn) queueControlFrame(write func(*http2.Framer) error) error {
+	if len(c.control) >= maxQueuedHTTP2ControlFrames {
+		return errors.New("connect-ip: the proxy doesn't read its control frames")
+	}
 	c.control = append(c.control, write)
 	c.cond.Broadcast()
+	return nil
 }
 
+// writeFrame writes frames with the Framer, one writer at a time.
 func (c *HTTP2ClientConn) writeFrame(write func(*http2.Framer) error) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	return write(c.fr)
 }
 
+// writeControlFrames writes the control frames in the order they were queued, until the connection fails.
 func (c *HTTP2ClientConn) writeControlFrames() {
 	for {
 		c.mu.Lock()
@@ -389,6 +452,7 @@ func (c *HTTP2ClientConn) writeControlFrames() {
 	}
 }
 
+// readFrames reads the frames of the proxy, which must start with its SETTINGS, until the connection fails.
 func (c *HTTP2ClientConn) readFrames() {
 	for first := true; ; first = false {
 		f, err := c.fr.ReadFrame()
@@ -407,6 +471,7 @@ func (c *HTTP2ClientConn) readFrames() {
 	}
 }
 
+// handleFrame applies a frame from the proxy. An error ends the connection.
 func (c *HTTP2ClientConn) handleFrame(f http2.Frame) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -434,19 +499,10 @@ func (c *HTTP2ClientConn) handleFrame(f http2.Frame) error {
 	return nil
 }
 
-func (c *HTTP2ClientConn) checkControlQueue() error {
-	if len(c.control) >= maxQueuedHTTP2ControlFrames {
-		return errors.New("connect-ip: the proxy doesn't read its control frames")
-	}
-	return nil
-}
-
+// handleSettings applies the settings of the proxy, and acknowledges them.
 func (c *HTTP2ClientConn) handleSettings(f *http2.SettingsFrame) error {
 	if f.IsAck() {
 		return nil
-	}
-	if err := c.checkControlQueue(); err != nil {
-		return err
 	}
 	err := f.ForeachSetting(func(s http2.Setting) error {
 		if err := s.Valid(); err != nil {
@@ -472,14 +528,21 @@ func (c *HTTP2ClientConn) handleSettings(f *http2.SettingsFrame) error {
 	if c.streamSend > http2MaxWindow {
 		return http2.ConnectionError(http2.ErrCodeFlowControl)
 	}
-	c.queueControlFrame(func(fr *http2.Framer) error { return fr.WriteSettingsAck() })
+	if err := c.queueControlFrame(func(fr *http2.Framer) error { return fr.WriteSettingsAck() }); err != nil {
+		return err
+	}
 	if !c.sawSettings {
 		c.sawSettings = true
 		close(c.settings)
 	}
+	if !c.noStreams && c.streamsAllowed != nil {
+		close(c.streamsAllowed)
+		c.streamsAllowed = nil
+	}
 	return nil
 }
 
+// handleHeaders reads the response to the request, after any interim responses, and then its trailers.
 func (c *HTTP2ClientConn) handleHeaders(f *http2.MetaHeadersFrame) error {
 	if f.StreamID != http2StreamID || !c.dialed {
 		return fmt.Errorf("connect-ip: unexpected HEADERS from the proxy on stream %d", f.StreamID)
@@ -539,6 +602,8 @@ func parseHTTP2Status(s string) (int, error) {
 	return strconv.Atoi(s)
 }
 
+// handleData buffers the data of the stream for Read, within the receive window.
+// Once the local side stopped reading, it drops the data and credits it right away.
 func (c *HTTP2ClientConn) handleData(f *http2.DataFrame) error {
 	if f.StreamID != http2StreamID || !c.responded {
 		return fmt.Errorf("connect-ip: unexpected DATA from the proxy on stream %d", f.StreamID)
@@ -552,12 +617,14 @@ func (c *HTTP2ClientConn) handleData(f *http2.DataFrame) error {
 	if c.recvUsed > c.window {
 		return http2.ConnectionError(http2.ErrCodeFlowControl)
 	}
-	if c.recvClosed {
-		c.consume(size)
-	} else {
+	consumed := size
+	if !c.recvClosed {
 		data := f.Data()
 		c.recv.Write(data)
-		c.consume(size - int64(len(data)))
+		consumed -= int64(len(data))
+	}
+	if err := c.consume(consumed); err != nil {
+		return err
 	}
 	if f.StreamEnded() {
 		c.recvEnded = true
@@ -571,18 +638,22 @@ func (c *HTTP2ClientConn) handleData(f *http2.DataFrame) error {
 // and queues a single WINDOW_UPDATE at a time, which takes the credit accrued while it waited.
 // The window only widens when the writer takes the credit: a proxy that sends more than
 // it was credited exceeds the window, and can't make the control queue grow.
-func (c *HTTP2ClientConn) consume(n int64) {
+func (c *HTTP2ClientConn) consume(n int64) error {
 	c.recvCredit += n
 	if c.creditQueued || c.recvCredit < c.window/2 {
-		return
+		return nil
+	}
+	if err := c.queueControlFrame(c.writeWindowUpdate); err != nil {
+		return err
 	}
 	c.creditQueued = true
-	c.queueControlFrame(c.writeWindowUpdate)
+	return nil
 }
 
 // writeWindowUpdate credits the proxy with what was consumed, on both the connection and the stream.
 func (c *HTTP2ClientConn) writeWindowUpdate(fr *http2.Framer) error {
 	c.mu.Lock()
+	// recvCredit <= recvUsed <= window <= 2^31-1, which handleData enforces.
 	credit := uint32(c.recvCredit)
 	c.recvUsed -= c.recvCredit
 	c.recvCredit = 0
@@ -594,6 +665,7 @@ func (c *HTTP2ClientConn) writeWindowUpdate(fr *http2.Framer) error {
 	return fr.WriteWindowUpdate(http2StreamID, credit)
 }
 
+// handleWindowUpdate widens the send window of the connection or the stream.
 func (c *HTTP2ClientConn) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 	window := &c.streamSend
 	if f.StreamID == 0 {
@@ -610,6 +682,7 @@ func (c *HTTP2ClientConn) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 	return nil
 }
 
+// handlePing answers the PING frames of the proxy, and completes the Ping calls it acknowledges.
 func (c *HTTP2ClientConn) handlePing(f *http2.PingFrame) error {
 	if f.IsAck() {
 		if ack, ok := c.pings[f.Data]; ok {
@@ -618,14 +691,12 @@ func (c *HTTP2ClientConn) handlePing(f *http2.PingFrame) error {
 		}
 		return nil
 	}
-	if err := c.checkControlQueue(); err != nil {
-		return err
-	}
 	data := f.Data
-	c.queueControlFrame(func(fr *http2.Framer) error { return fr.WritePing(true, data) })
-	return nil
+	return c.queueControlFrame(func(fr *http2.Framer) error { return fr.WritePing(true, data) })
 }
 
+// handleReset ends the connection when the proxy resets the stream, except with NO_ERROR
+// after a complete response, which only stops the request.
 func (c *HTTP2ClientConn) handleReset(f *http2.RSTStreamFrame) error {
 	if f.StreamID != http2StreamID || !c.dialed {
 		return http2.ConnectionError(http2.ErrCodeProtocol)
@@ -640,6 +711,7 @@ func (c *HTTP2ClientConn) handleReset(f *http2.RSTStreamFrame) error {
 	return nil
 }
 
+// reset aborts the stream with code, once.
 func (c *HTTP2ClientConn) reset(code http2.ErrCode) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -654,7 +726,9 @@ func (c *HTTP2ClientConn) reset(code http2.ErrCode) {
 		// framing, so it ends the connection, which this stream was the only use of.
 		_ = c.nc.SetWriteDeadline(time.Now())
 	}
-	c.queueControlFrame(func(fr *http2.Framer) error { return fr.WriteRSTStream(http2StreamID, code) })
+	if err := c.queueControlFrame(func(fr *http2.Framer) error { return fr.WriteRSTStream(http2StreamID, code) }); err != nil {
+		c.failLocked(err)
+	}
 }
 
 // reserve waits for flow control to allow sending a frame of up to size bytes, and returns its size.
@@ -684,6 +758,7 @@ type clientBody struct {
 
 var _ http2Body = &clientBody{}
 
+// Read returns the data that the proxy sent on the stream, and credits it back to the proxy.
 func (b *clientBody) Read(p []byte) (int, error) {
 	c := b.c
 	c.mu.Lock()
@@ -700,10 +775,13 @@ func (b *clientBody) Read(p []byte) (int, error) {
 		c.cond.Wait()
 	}
 	n, _ := c.recv.Read(p)
-	c.consume(int64(n))
+	if err := c.consume(int64(n)); err != nil {
+		c.failLocked(err)
+	}
 	return n, nil
 }
 
+// Write sends p in DATA frames, as fast as flow control allows.
 func (b *clientBody) Write(p []byte) (int, error) {
 	c := b.c
 	var written int
@@ -773,6 +851,7 @@ func (c *HTTP2ClientConn) writeData(frame []byte) (int, error) {
 	return sent, nil
 }
 
+// CloseWrite ends the stream with an empty DATA frame.
 func (b *clientBody) CloseWrite() error {
 	c := b.c
 	c.mu.Lock()
@@ -781,18 +860,25 @@ func (b *clientBody) CloseWrite() error {
 		return nil
 	}
 	c.sendClosed = true
-	c.queueControlFrame(func(fr *http2.Framer) error { return fr.WriteData(http2StreamID, true, nil) })
+	if err := c.queueControlFrame(func(fr *http2.Framer) error { return fr.WriteData(http2StreamID, true, nil) }); err != nil {
+		c.failLocked(err)
+		return err
+	}
 	return nil
 }
 
+// CloseRead drops the buffered data, and the data the proxy still sends, which it credits right away.
 func (b *clientBody) CloseRead() {
 	c := b.c
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.recvClosed = true
-	c.consume(int64(c.recv.Len()))
+	if err := c.consume(int64(c.recv.Len())); err != nil {
+		c.failLocked(err)
+	}
 	c.recv.Reset()
 	c.cond.Broadcast()
 }
 
+// Reset aborts the stream.
 func (b *clientBody) Reset(code http2.ErrCode) { b.c.reset(code) }

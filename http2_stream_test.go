@@ -38,6 +38,7 @@ type fakeHTTP2Body struct {
 	reseted    chan struct{}
 }
 
+// newFakeHTTP2Body returns a body that reads from r, or that blocks reads until CloseRead if r is nil.
 func newFakeHTTP2Body(r io.Reader) *fakeHTTP2Body {
 	b := &fakeHTTP2Body{Reader: r, reseted: make(chan struct{}), readClosed: make(chan struct{})}
 	if r == nil {
@@ -54,6 +55,7 @@ func (r blockingReader) Read([]byte) (int, error) {
 	return 0, net.ErrClosed
 }
 
+// Write records p, once gate lets it through. A reset fails a Write that waits for gate.
 func (b *fakeHTTP2Body) Write(p []byte) (int, error) {
 	if b.gate != nil {
 		select {
@@ -78,6 +80,7 @@ func (b *fakeHTTP2Body) CloseWrite() error {
 	return nil
 }
 
+// CloseRead unblocks a read that waits for data.
 func (b *fakeHTTP2Body) CloseRead() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -87,6 +90,7 @@ func (b *fakeHTTP2Body) CloseRead() {
 	}
 }
 
+// Reset records code, and fails a Write that waits for gate.
 func (b *fakeHTTP2Body) Reset(code http2.ErrCode) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -108,6 +112,8 @@ func appendTestCapsule(b []byte, typ http3.CapsuleType, payload string) []byte {
 	return append(b, payload...)
 }
 
+// TestHTTP2StreamSeparatesDatagrams checks that Read returns every capsule except the DATAGRAM ones,
+// which ReceiveDatagram returns, however the body splits the stream.
 func TestHTTP2StreamSeparatesDatagrams(t *testing.T) {
 	var input, want []byte
 	input = appendTestCapsule(input, capsuleTypeRouteAdvertisement, "route")
@@ -141,6 +147,7 @@ func TestHTTP2StreamSeparatesDatagrams(t *testing.T) {
 	}
 }
 
+// TestHTTP2StreamTruncatedCapsule checks that a stream ending in the middle of a capsule is an error.
 func TestHTTP2StreamTruncatedCapsule(t *testing.T) {
 	datagram := appendTestCapsule(nil, capsuleTypeDatagram, "datagram")
 	for name, input := range map[string][]byte{
@@ -168,6 +175,8 @@ func TestHTTP2StreamDropsOversizedDatagrams(t *testing.T) {
 	require.Empty(t, s.datagrams)
 }
 
+// TestHTTP2StreamDropsDatagramsNobodyReads checks that DATAGRAM capsules that nobody receives
+// are dropped once the queue is full, without holding up the other capsules.
 func TestHTTP2StreamDropsDatagramsNobodyReads(t *testing.T) {
 	var input []byte
 	for range maxQueuedHTTP2Datagrams + 1 {
@@ -212,6 +221,8 @@ func TestHTTP2StreamSendsCapsules(t *testing.T) {
 	require.Empty(t, body.reset)
 }
 
+// TestHTTP2StreamSendDatagramDoesNotWait checks that SendDatagram drops packets, and counts them,
+// instead of waiting for a stream that doesn't take them.
 func TestHTTP2StreamSendDatagramDoesNotWait(t *testing.T) {
 	body := newFakeHTTP2Body(nil)
 	body.gate = make(chan struct{})
@@ -287,6 +298,7 @@ func fillHTTP2Stream(t *testing.T, s *http2Stream) {
 	}
 }
 
+// TestHTTP2StreamWriteWaitsForRoom checks that Write, unlike SendDatagram, waits for the queue to drain.
 func TestHTTP2StreamWriteWaitsForRoom(t *testing.T) {
 	body := newFakeHTTP2Body(nil)
 	body.gate = make(chan struct{})
@@ -342,6 +354,7 @@ func TestHTTP2StreamCloseTimesOut(t *testing.T) {
 	})
 }
 
+// TestHTTP2StreamCancelWrite checks that CancelWrite resets the stream with the HTTP/2 counterpart of its code.
 func TestHTTP2StreamCancelWrite(t *testing.T) {
 	for name, tc := range map[string]struct {
 		code quic.StreamErrorCode
@@ -367,6 +380,7 @@ func TestHTTP2StreamCancelWrite(t *testing.T) {
 	}
 }
 
+// TestHTTP2StreamCancelRead checks that CancelRead stops a Read in progress.
 func TestHTTP2StreamCancelRead(t *testing.T) {
 	body := newFakeHTTP2Body(nil)
 	s := newHTTP2Stream(body)

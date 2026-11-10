@@ -49,10 +49,10 @@ type HTTP2Config struct {
 // HTTP/2 runs over TCP, so a proxied connection is subject to TCP's retransmissions
 // and head-of-line blocking. HTTP/3 should be preferred whenever it is available.
 type HTTP2ClientConn struct {
-	nc     net.Conn
-	fr     *http2.Framer
-	window int64
-
+	// Set by NewHTTP2ClientConn, and never changed.
+	nc       net.Conn
+	fr       *http2.Framer
+	window   int64               // the receive window of the connection and of the stream
 	settings chan struct{}       // closed when the first SETTINGS frame arrives
 	response chan *http.Response // receives the response to Dial
 	done     chan struct{}       // closed when the connection fails, after setting err
@@ -62,32 +62,44 @@ type HTTP2ClientConn struct {
 	// because their writes are blocked, none of these writes would finish.
 	wmu sync.Mutex
 
-	mu              sync.Mutex
-	cond            *sync.Cond
-	err             error
-	control         []func(*http2.Framer) error // frames owed to the proxy, written ahead of DATA frames
+	// mu guards the fields below. cond wakes up the goroutines that wait
+	// for them to change: writeControlFrames, reserve and clientBody.Read.
+	mu   sync.Mutex
+	cond *sync.Cond
+	err  error
+
+	// The settings of the proxy that Dial waits for.
 	sawSettings     bool
 	extendedConnect bool
 	noStreams       bool          // the proxy's SETTINGS_MAX_CONCURRENT_STREAMS is 0
 	streamsAllowed  chan struct{} // closed when the proxy allows streams again, if Dial waits for it
-	dialing         bool          // Dial was called
-	dialed          bool          // the request was sent
-	responded       bool
-	writing         bool // a DATA frame is being written, and may be blocked in the network
-	pingID          uint64
-	pings           map[[8]byte]chan struct{}
-	connSend        int64 // connection-level send window
-	streamSend      int64 // stream-level send window
-	initialSend     int64 // the proxy's SETTINGS_INITIAL_WINDOW_SIZE
-	maxFrame        int64 // the proxy's SETTINGS_MAX_FRAME_SIZE
-	sendClosed      bool
-	resetSent       bool
-	recv            bytes.Buffer
-	recvEnded       bool  // the proxy ended the stream
-	recvClosed      bool  // the local side stopped reading
-	recvUsed        int64 // bytes the proxy sent, until the writer takes their credit
-	recvCredit      int64 // the part of recvUsed that was consumed, and can be credited
-	creditQueued    bool  // a WINDOW_UPDATE for recvCredit waits in control
+
+	// The request and its response.
+	dialing   bool // Dial was called
+	dialed    bool // the request was sent
+	responded bool
+
+	// The control frames, and the pings that wait for their answer.
+	control []func(*http2.Framer) error // frames owed to the proxy, written ahead of DATA frames
+	pingID  uint64
+	pings   map[[8]byte]chan struct{}
+
+	// The send side of the stream, and its flow control.
+	connSend    int64 // connection-level send window
+	streamSend  int64 // stream-level send window
+	initialSend int64 // the proxy's SETTINGS_INITIAL_WINDOW_SIZE
+	maxFrame    int64 // the proxy's SETTINGS_MAX_FRAME_SIZE
+	writing     bool  // a DATA frame is being written, and may be blocked in the network
+	sendClosed  bool
+	resetSent   bool
+
+	// The receive side of the stream, and its flow control.
+	recv         bytes.Buffer
+	recvEnded    bool  // the proxy ended the stream
+	recvClosed   bool  // the local side stopped reading
+	recvUsed     int64 // bytes the proxy sent, until the writer takes their credit
+	recvCredit   int64 // the part of recvUsed that was consumed, and can be credited
+	creditQueued bool  // a WINDOW_UPDATE for recvCredit waits in control
 }
 
 // NewHTTP2ClientConn starts an HTTP/2 connection on conn, a TLS connection that negotiated
